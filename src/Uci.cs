@@ -1,9 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Diagnostics;
-
-using Key = System.UInt64;
+﻿using Key = System.UInt64;
 using Bitboard = System.UInt64;
 using Move = System.Int32;
 using File = System.Int32;
@@ -22,6 +17,9 @@ using Phase = System.Int32;
 
 namespace Portfish
 {
+    using System.Collections.Generic;
+    using System.Diagnostics;
+
     internal static class Uci
     {
         // FEN string of the initial position, normal chess
@@ -31,20 +29,21 @@ namespace Portfish
         // position just before to start searching). This is needed by draw detection
         // where, due to 50 moves rule, we need to check at most 100 plies back.
         internal static readonly StateInfo[] StateRingBuf = new StateInfo[102];
-        internal static int SetupStatePos = 0; // *SetupState = StateRingBuf;
+
+        internal static int SetupStatePos; // *SetupState = StateRingBuf;
 
         /// Wait for a command from the user, parse this text string as an UCI command,
         /// and call the appropriate functions. Also intercepts EOF from stdin to ensure
         /// that we exit gracefully if the GUI dies unexpectedly. In addition to the UCI
         /// commands, the function also supports a few debug commands.
-        internal static void uci_loop(string args)
+        internal static void loop(string args)
         {
-            for (int i = 0; i < 102; i++)
+            for (var i = 0; i < 102; i++)
             {
                 StateRingBuf[i] = new StateInfo();
             }
 
-            Position pos = new Position(StartFEN, false, Threads.main_thread()); // The root position
+            var pos = new Position(StartFEN, false, Threads.main_thread()); // The root position
             string cmd, token = string.Empty;
 
             while (token != "quit")
@@ -53,30 +52,39 @@ namespace Portfish
                 {
                     cmd = args;
                 }
-                else if (String.IsNullOrEmpty(cmd = Plug.ReadLine())) // Block here waiting for input
+                else if (string.IsNullOrEmpty(cmd = Plug.ReadLine())) // Block here waiting for input
                 {
-                    cmd = "quit";
+                    // Use a loop to wait for input without exiting
+                    do
+                    {
+                        cmd = Plug.ReadLine();
+                        if (string.IsNullOrEmpty(cmd))
+                        {
+                            // Small delay to prevent busy waiting
+                            System.Threading.Thread.Sleep(10);
+                        }
+                    } while (string.IsNullOrEmpty(cmd));
                 }
-                Stack<string> stack = Utils.CreateStack(cmd);
+                var stack = Utils.CreateStack(cmd);
 
                 token = stack.Pop();
 
-                if (token == "quit" || token == "stop")
+                if (token == "quit" || token == "stop" || token == "ponderhit")
                 {
-                    Search.SignalsStop = true;
-                    Threads.wait_for_search_finished(); // Cannot quit while threads are running
-                }
-                else if (token == "ponderhit")
-                {
-                    // The opponent has played the expected move. GUI sends "ponderhit" if
-                    // we were told to ponder on the same move the opponent has played. We
-                    // should continue searching but switching from pondering to normal search.
-                    Search.Limits.ponder = false;
+                    // GUI sends 'ponderhit' to tell us to ponder on the same move the
+                    // opponent has played. In case Signals.stopOnPonderhit is set we are
+                    // waiting for 'ponderhit' to stop the search (for instance because we
+                    // already ran out of time), otherwise we should continue searching but
+                    // switching from pondering to normal search.
 
-                    if (Search.SignalsStopOnPonderhit)
+                    if (token != "ponderhit" || Search.SignalsStopOnPonderhit)
                     {
                         Search.SignalsStop = true;
-                        Threads.main_thread().wake_up(); // Could be sleeping
+                        Threads.main_thread().notify_one(); // Could be sleeping
+                    }
+                    else
+                    {
+                        Search.Limits.ponder = false;
                     }
                 }
                 else if (token == "go")
@@ -84,7 +92,9 @@ namespace Portfish
                     go(pos, stack);
                 }
                 else if (token == "ucinewgame")
-                { /* Avoid returning "Unknown command" */ }
+                {
+                    TT.clear();
+                }
                 else if (token == "isready")
                 {
                     Plug.Write("readyok");
@@ -122,7 +132,7 @@ namespace Portfish
                 else if (token == "key")
                 {
                     Plug.Write("key: ");
-                    Plug.Write(String.Format("{0:X}", pos.key()));
+                    Plug.Write(string.Format("{0:X}", pos.key()));
                     Plug.Write("\nmaterial key: ");
                     Plug.Write(pos.material_key().ToString());
                     Plug.Write("\npawn key: ");
@@ -131,16 +141,23 @@ namespace Portfish
                 }
                 else if (token == "uci")
                 {
-                    Plug.Write("id name "); Plug.Write(Utils.engine_info(true));
-                    Plug.Write("\n"); Plug.Write(OptionMap.Instance.ToString());
-                    Plug.Write("\nuciok"); Plug.Write(Constants.endl);
+                    Plug.Write("id name ");
+                    Plug.Write(Utils.engine_info(true));
+                    Plug.Write("\n");
+                    Plug.Write(OptionMap.Instance.ToString());
+                    Plug.Write("\nuciok");
+                    Plug.Write(Constants.endl);
                 }
                 else if (token == "perft")
                 {
-                    token = stack.Pop();  // Read depth
-                    Stack<string> ss = Utils.CreateStack(
-                        string.Format("{0} {1} {2} current perft", OptionMap.Instance["Hash"].v, OptionMap.Instance["Threads"].v, token)
-                        );
+                    token = stack.Pop(); // Read depth
+                    var ss =
+                        Utils.CreateStack(
+                            string.Format(
+                                "{0} {1} {2} current perft",
+                                OptionMap.Instance["Hash"].v,
+                                OptionMap.Instance["Threads"].v,
+                                token));
                     Benchmark.benchmark(pos, ss);
                 }
                 else
@@ -152,10 +169,9 @@ namespace Portfish
 
                 if (args.Length > 0) // Command line arguments have one-shot behaviour
                 {
-                    Threads.wait_for_search_finished();
+                    Threads.wait_for_think_finished();
                     break;
                 }
-
             }
         }
 
@@ -165,7 +181,7 @@ namespace Portfish
         // makes the moves given in the following move list ("moves").
         internal static void set_position(Position pos, Stack<string> stack)
         {
-            Move m;
+            int m;
             string token, fen = string.Empty;
 
             token = stack.Pop();
@@ -173,13 +189,22 @@ namespace Portfish
             if (token == "startpos")
             {
                 fen = StartFEN;
-                if (stack.Count > 0) { token = stack.Pop(); } // Consume "moves" token if any
+                if (stack.Count > 0)
+                {
+                    token = stack.Pop();
+                } // Consume "moves" token if any
             }
             else if (token == "fen")
+            {
                 while ((stack.Count > 0) && (token = stack.Pop()) != "moves")
+                {
                     fen += token + " ";
+                }
+            }
             else
+            {
                 return;
+            }
 
             pos.from_fen(fen, bool.Parse(OptionMap.Instance["UCI_Chess960"].v), Threads.main_thread());
 
@@ -232,42 +257,68 @@ namespace Portfish
         // the main searching thread.
         internal static void go(Position pos, Stack<string> stack)
         {
-            string token = string.Empty;
-            LimitsType limits = new LimitsType();
-            List<Move> searchMoves = new List<Phase>();
+            var token = string.Empty;
+            var limits = new LimitsType();
+            var searchMoves = new List<int>();
 
             while (stack.Count > 0)
             {
                 token = stack.Pop();
 
                 if (token == "wtime")
+                {
                     limits.time[ColorC.WHITE] = int.Parse(stack.Pop());
+                }
                 else if (token == "btime")
+                {
                     limits.time[ColorC.BLACK] = int.Parse(stack.Pop());
+                }
                 else if (token == "winc")
+                {
                     limits.inc[ColorC.WHITE] = int.Parse(stack.Pop());
+                }
                 else if (token == "binc")
+                {
                     limits.inc[ColorC.BLACK] = int.Parse(stack.Pop());
+                }
                 else if (token == "movestogo")
+                {
                     limits.movesToGo = int.Parse(stack.Pop());
+                }
                 else if (token == "depth")
+                {
                     limits.depth = int.Parse(stack.Pop());
+                }
                 else if (token == "nodes")
+                {
                     limits.nodes = int.Parse(stack.Pop());
+                }
                 else if (token == "movetime")
+                {
                     limits.movetime = int.Parse(stack.Pop());
+                }
+                else if (token == "mate")
+                {
+                    limits.mate = int.Parse(stack.Pop());
+                }
                 else if (token == "infinite")
+                {
                     limits.infinite = 1;
+                }
                 else if (token == "ponder")
+                {
                     limits.ponder = true;
+                }
                 else if (token == "searchmoves")
+                {
                     while ((token = stack.Pop()) != null)
                     {
                         searchMoves.Add(Utils.move_from_uci(pos, token));
                     }
+                }
             }
 
-            Threads.start_searching(pos, limits, searchMoves);
+            Threads.start_thinking(pos, limits, searchMoves);
         }
     }
 }
